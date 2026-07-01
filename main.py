@@ -1,4 +1,6 @@
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+# pyrefly: ignore [missing-import]
 from fastapi.responses import JSONResponse
 import hmac
 import hashlib
@@ -51,11 +53,18 @@ def process_pull_request(event: PullRequestEvent):
     vcs_adapter = GitHubAdapter(token=settings.GITHUB_TOKEN)
     
     # LLM Adapter selection based on config
-    if settings.LLM_PROVIDER.lower() == "openai":
+    llm_provider_lower = settings.LLM_PROVIDER.lower()
+    if llm_provider_lower == "openai":
         if not settings.OPENAI_API_KEY:
             logger.error("OpenAI API key not configured, cannot proceed.")
             return
         llm_adapter = OpenAIAdapter(api_key=settings.OPENAI_API_KEY)
+    elif llm_provider_lower == "github_models":
+        if not settings.GITHUB_TOKEN:
+            logger.error("GitHub token not configured, cannot proceed with GitHub Models.")
+            return
+        from adapters.llm.github_models import GitHubModelsAdapter
+        llm_adapter = GitHubModelsAdapter(token=settings.GITHUB_TOKEN, model=settings.GITHUB_MODEL_NAME)
     else:
         logger.error(f"Unsupported LLM provider: {settings.LLM_PROVIDER}")
         return
