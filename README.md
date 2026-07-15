@@ -1,12 +1,14 @@
 # AI Pull Request Review Agent
 
-An intelligent, self-hosted AI agent for automated Pull Request reviews. This project relies entirely on pure Python, avoiding heavy external agentic frameworks (like LangChain or AutoGen) to maintain strict control over the LLM execution pipeline, tool calling, and context window management. 
+An intelligent, self-hosted AI agent for automated Pull Request reviews leveraging a **Conversational Human-in-the-Loop (HITL)** architecture. 
+
+Users can chat with the agent to list PRs, get context, and explicitly authorize deep code reviews. This project relies entirely on pure Python, avoiding heavy external agentic frameworks (like LangChain or AutoGen) to maintain strict control over the LLM execution pipeline, tool calling, and context window management. 
 
 ## Features
-- **Adapter-based Architecture**: Highly decoupled design allowing seamless swapping of VCS providers (GitHub, GitLab) and LLMs (OpenAI, Anthropic, Gemini).
+- **Conversational API**: A stateless `/chat` endpoint allows you to talk to the AI (like ChatGPT or Claude) to manage and review PRs.
+- **Two-Tier Agent Loop**: A foreground Chat Agent handles conversation and tools, while a background Review Agent handles massive diff parsing and GitHub commenting.
+- **Adapter-based Architecture**: Highly decoupled design allowing seamless swapping of VCS providers (GitHub) and LLMs (OpenAI, GitHub Models).
 - **Internal MCP Server**: Uses the Model Context Protocol (MCP) via an internal JSON-RPC pipeline to safely expose repository codebase tools to the LLM.
-- **FastAPI Webhook Receiver**: Receives PR events locally and delegates processing to background tasks.
-- **Framework-Free**: A custom ReAct/Chain-of-Thought loop for maximum predictability and minimal dependencies.
 
 ## Project Structure
 

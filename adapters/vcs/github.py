@@ -28,6 +28,21 @@ class GitHubAdapter(BaseVCSAdapter):
         response.raise_for_status()
         return response.text
 
+    def list_pull_requests(self, repo_name: str, state: str = "open") -> List[Dict[str, Any]]:
+        response = self.client.get(
+            f"/repos/{repo_name}/pulls",
+            params={"state": state}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def get_pull_request_metadata(self, repo_name: str, pr_number: int) -> Dict[str, Any]:
+        response = self.client.get(
+            f"/repos/{repo_name}/pulls/{pr_number}"
+        )
+        response.raise_for_status()
+        return response.json()
+
     def post_review_comment(self, repo_name: str, pr_number: int, comment: str) -> None:
         response = self.client.post(
             f"/repos/{repo_name}/issues/{pr_number}/comments",

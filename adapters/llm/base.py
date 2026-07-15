@@ -24,3 +24,8 @@ class BaseLLMAdapter(ABC):
         tools should be provided in standard OpenAI function calling format or JSON Schema.
         """
         pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """Clean up any open connections."""
+        pass

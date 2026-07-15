@@ -8,10 +8,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 class PRReviewAgent:
-    def __init__(self, vcs_adapter: BaseVCSAdapter, llm_adapter: BaseLLMAdapter):
+    def __init__(self, vcs_adapter: BaseVCSAdapter, llm_adapter: BaseLLMAdapter, mcp_client: InternalMCPClient):
         self.vcs = vcs_adapter
         self.llm = llm_adapter
-        self.mcp = InternalMCPClient()
+        self.mcp = mcp_client
         self.max_loops = 5
 
     def review_pr(self, repo_name: str, pr_number: int):

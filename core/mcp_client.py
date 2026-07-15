@@ -3,8 +3,8 @@ from mcp_server.server import MCPServer
 import uuid
 
 class InternalMCPClient:
-    def __init__(self):
-        self.server = MCPServer()
+    def __init__(self, mcp_server: MCPServer):
+        self.server = mcp_server
         
     def get_tools(self):
         req = MCPRequest(method="tools/list", id=str(uuid.uuid4()))

@@ -12,16 +12,12 @@ class MCPServer:
         self.tools: Dict[str, Callable] = {
             "read_file": read_file
         }
-        
-    def get_tool_schemas(self) -> list[Dict[str, Any]]:
-        """Return tool schemas in OpenAI function calling format."""
-        schemas = []
-        for name, func in self.tools.items():
-            schemas.append({
+        self.tool_schemas = [
+            {
                 "type": "function",
                 "function": {
-                    "name": name,
-                    "description": inspect.getdoc(func) or f"Execute {name}",
+                    "name": "read_file",
+                    "description": inspect.getdoc(read_file) or "Execute read_file",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -33,8 +29,49 @@ class MCPServer:
                         "required": ["file_path"]
                     }
                 }
-            })
-        return schemas
+            }
+        ]
+
+    def register_github_tools(self, github_tools):
+        self.tools["list_prs"] = github_tools.list_prs
+        self.tools["trigger_review"] = github_tools.trigger_review
+        
+        self.tool_schemas.extend([
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_prs",
+                    "description": inspect.getdoc(github_tools.list_prs) or "List PRs",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "repo_name": {"type": "string", "description": "The full repository name, e.g. 'sandipazi/Code_Review_Agent'"},
+                            "state": {"type": "string", "description": "State of PRs to list (open, closed, all)"}
+                        },
+                        "required": ["repo_name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "trigger_review",
+                    "description": inspect.getdoc(github_tools.trigger_review) or "Trigger PR review",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "repo_name": {"type": "string", "description": "The full repository name"},
+                            "pr_number": {"type": "integer", "description": "The pull request number"}
+                        },
+                        "required": ["repo_name", "pr_number"]
+                    }
+                }
+            }
+        ])
+        
+    def get_tool_schemas(self) -> list[Dict[str, Any]]:
+        """Return tool schemas in OpenAI function calling format."""
+        return self.tool_schemas
 
     def handle_request(self, request: MCPRequest) -> MCPResponse:
         logger.info(f"MCP Server received request: {request.method}")
