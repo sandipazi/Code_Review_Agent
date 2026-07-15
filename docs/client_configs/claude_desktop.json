@@ -1,0 +1,13 @@
+{
+  "_comment": "Add this snippet to ~/Library/Application Support/Claude/claude_desktop_config.json (macOS) or %APPDATA%\\Claude\\claude_desktop_config.json (Windows)",
+  "mcpServers": {
+    "pr-review-agent": {
+      "command": "python",
+      "args": [
+        "/absolute/path/to/Code_Review_Agent/mcp_runner.py",
+        "--github-token",
+        "ghp_YOUR_GITHUB_TOKEN_HERE"
+      ]
+    }
+  }
+}

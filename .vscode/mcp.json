@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "pr-review-agent": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "${workspaceFolder}/mcp_runner.py",
+        "--github-token",
+        "${env:GITHUB_TOKEN}"
+      ],
+      "env": {}
+    }
+  }
+}

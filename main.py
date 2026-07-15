@@ -12,6 +12,7 @@ from core.agent import PRReviewAgent
 from core.chat_agent import ChatAgent
 from core.mcp_client import InternalMCPClient
 from mcp_server.server import MCPServer
+from mcp_server.http_transport import router as mcp_router
 from mcp_server.tools.github_tools import GitHubTools
 import logging
 
@@ -19,6 +20,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI PR Review Agent (HITL)")
+
+# Mount the MCP HTTP transport — accepts JSON-RPC from any external MCP client
+# Usage: POST /mcp  with  X-GitHub-Token: <token>  header
+app.include_router(mcp_router, prefix="/mcp", tags=["MCP"])
 
 def verify_signature(payload: bytes, signature_header: str) -> bool:
     if not settings.GITHUB_WEBHOOK_SECRET:

@@ -1,0 +1,13 @@
+{
+  "_comment": "Add this to Cursor Settings → MCP Servers. Same format as Claude Desktop.",
+  "mcpServers": {
+    "pr-review-agent": {
+      "command": "python",
+      "args": [
+        "/absolute/path/to/Code_Review_Agent/mcp_runner.py",
+        "--github-token",
+        "ghp_YOUR_GITHUB_TOKEN_HERE"
+      ]
+    }
+  }
+}
