@@ -9,9 +9,17 @@ The application has been restructured to support a **Human-in-the-Loop (HITL)** 
 ```mermaid
 graph TD
     User([User / Frontend]) -->|Stateless Chat History| A(FastAPI /chat)
+    IDE([IDE / Claude Desktop]) -->|stdio| M2[mcp_runner.py]
+    RemoteAgent([Remote Agent]) -->|HTTP JSON-RPC| A
+    
     A --> B[Chat Agent Loop]
+    A --> M1[MCP HTTP Transport]
+    
     B -->|Tool: list_prs, trigger_review| C[MCP Client]
-    C --> D[Internal MCP Server]
+    C --> D[MCP Server Core]
+    M1 --> D
+    M2 -->|MCP SDK Wrapper| D
+    
     D -->|trigger_review| E[BackgroundTasks Job]
     E -->|Start| F[PR Review Agent]
     
@@ -40,9 +48,12 @@ graph TD
 - **Technology**: Raw Python ReAct Loop.
 - **Responsibility**: Runs asynchronously in the background. It takes a specific PR diff, analyzes it, and posts the final JSON-structured feedback directly to the VCS platform.
 
-### 5. Internal MCP Server & Tools
-- **Technology**: Custom JSON-RPC over local function calls.
-- **Tools Available**: `read_file`, `list_prs`, `trigger_review`.
+### 5. Transport-Agnostic MCP Server & Tools
+- **Technology**: Core logic decoupled from transports; official Python MCP SDK for stdio, raw JSON-RPC for HTTP.
+- **Responsibility**: Exposes repository and review tools (`read_file`, `list_prs`, `trigger_review`) securely.
+- **Transports**:
+  - **HTTP (`mcp_server/http_transport.py`)**: A stateless FastAPI endpoint (`/mcp`) that accepts JSON-RPC over HTTP, ideal for remote agents or simple web clients.
+  - **stdio (`mcp_server/stdio_transport.py`)**: Wraps the core server with the official MCP SDK, enabling direct discovery and invocation from local IDEs (Cursor, VS Code) and Claude Desktop via `mcp_runner.py`.
 
 ### 6. Adapter Layer
 - **VCS Adapters** (`adapters/vcs/`): Interfaces for interacting with repositories (GitHub, GitLab).
