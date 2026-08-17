@@ -73,6 +73,11 @@ def get_adapters(github_token: Optional[str] = None):
     elif llm_provider_lower == "github_models":
         from adapters.llm.github_models import GitHubModelsAdapter
         llm_adapter = GitHubModelsAdapter(token=token, model=settings.GITHUB_MODEL_NAME)
+    elif llm_provider_lower == "groq":
+        if not settings.GROQ_API_KEY:
+            raise Exception("Groq API key not configured.")
+        from adapters.llm.groq import GroqAdapter
+        llm_adapter = GroqAdapter(api_key=settings.GROQ_API_KEY, model=settings.GROQ_MODEL_NAME)
     else:
         raise Exception(f"Unsupported LLM provider: {settings.LLM_PROVIDER}")
 

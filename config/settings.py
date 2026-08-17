@@ -12,11 +12,13 @@ class Settings(BaseSettings):
     GITHUB_WEBHOOK_SECRET: Optional[str] = None
 
     # LLM Settings
-    LLM_PROVIDER: str = "openai" # "openai", "anthropic", "gemini", "github_models"
+    LLM_PROVIDER: str = "openai" # "openai", "anthropic", "gemini", "github_models", "groq"
     OPENAI_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
     GITHUB_MODEL_NAME: str = "gpt-4o"
+    GROQ_API_KEY: Optional[str] = None
+    GROQ_MODEL_NAME: str = "llama-3.3-70b-versatile"
 
     # RAG Configuration
     RAG_ENABLED: bool = True
