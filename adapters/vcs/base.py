@@ -26,3 +26,18 @@ class BaseVCSAdapter(ABC):
     def post_inline_comment(self, repo_name: str, pr_number: int, commit_id: str, path: str, line: int, comment: str) -> None:
         """Post an inline comment on a specific line of code in a file."""
         pass
+
+    @abstractmethod
+    def get_review_comments(self, repo_name: str, pr_number: int) -> List[Dict[str, Any]]:
+        """Fetch all review comments (inline + general) for a pull request."""
+        pass
+
+    @abstractmethod
+    def list_files(self, repo_name: str, branch: str = "main", path: str = "") -> List[Any]:
+        """List files in a repository at a given branch and directory path."""
+        pass
+
+    @abstractmethod
+    def read_file(self, repo_name: str, file_path: str, branch: str = "main") -> str:
+        """Fetch the raw content of a file from the repository."""
+        pass

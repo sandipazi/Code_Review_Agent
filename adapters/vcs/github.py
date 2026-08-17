@@ -66,3 +66,42 @@ class GitHubAdapter(BaseVCSAdapter):
 
     def close(self):
         self.client.close()
+
+    def get_review_comments(self, repo_name: str, pr_number: int) -> List[Dict[str, Any]]:
+        """Fetch all inline review comments for a pull request."""
+        response = self.client.get(
+            f"/repos/{repo_name}/pulls/{pr_number}/comments"
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def list_files(self, repo_name: str, branch: str = "main", path: str = "") -> List[Dict[str, Any]]:
+        """
+        List files in a repository at a specific branch using the Git Trees API.
+        Returns a flat list of file dicts with 'path' and 'type' keys.
+        For large repos, the tree is returned recursively (up to GitHub's limit).
+        """
+        url = f"/repos/{repo_name}/git/trees/{branch}"
+        response = self.client.get(url, params={"recursive": "1"})
+        response.raise_for_status()
+        data = response.json()
+        # Filter to blobs (files) only, optionally under `path` prefix
+        items = [
+            {"path": item["path"], "type": "file", "size": item.get("size", 0)}
+            for item in data.get("tree", [])
+            if item["type"] == "blob" and item["path"].startswith(path)
+        ]
+        return items
+
+    def read_file(self, repo_name: str, file_path: str, branch: str = "main") -> str:
+        """
+        Fetch the raw content of a file from a GitHub repository.
+        Uses the raw content endpoint for efficiency.
+        """
+        response = self.client.get(
+            f"/repos/{repo_name}/contents/{file_path}",
+            params={"ref": branch},
+            headers={**self.headers, "Accept": "application/vnd.github.v3.raw"},
+        )
+        response.raise_for_status()
+        return response.text

@@ -18,6 +18,16 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
     GITHUB_MODEL_NAME: str = "gpt-4o"
 
+    # RAG Configuration
+    RAG_ENABLED: bool = True
+    RAG_DB_PATH: str = "./.rag_db"
+    RAG_EMBEDDER: str = "local" # "local" | "openai"
+    RAG_VECTOR_STORE: str = "chroma" # "chroma" | "qdrant"
+    RAG_TOP_K: int = 5
+    RAG_INGEST_CLOSED_PRS: int = 50
+    QDRANT_URL: str = ""
+    QDRANT_API_KEY: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 settings = Settings()
