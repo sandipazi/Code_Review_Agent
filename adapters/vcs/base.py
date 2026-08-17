@@ -13,6 +13,11 @@ class BaseVCSAdapter(ABC):
         pass
 
     @abstractmethod
+    def list_repositories(self) -> List[Dict[str, Any]]:
+        """List repositories accessible to the authenticated token."""
+        pass
+
+    @abstractmethod
     def get_pull_request_metadata(self, repo_name: str, pr_number: int) -> Dict[str, Any]:
         """Fetch metadata for a specific pull request."""
         pass

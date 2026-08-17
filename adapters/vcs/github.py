@@ -36,6 +36,15 @@ class GitHubAdapter(BaseVCSAdapter):
         response.raise_for_status()
         return response.json()
 
+    def list_repositories(self) -> List[Dict[str, Any]]:
+        """List repositories accessible to the authenticated token (first page, most-recently updated first)."""
+        response = self.client.get(
+            "/user/repos",
+            params={"per_page": 100, "sort": "updated"}
+        )
+        response.raise_for_status()
+        return response.json()
+
     def get_pull_request_metadata(self, repo_name: str, pr_number: int) -> Dict[str, Any]:
         response = self.client.get(
             f"/repos/{repo_name}/pulls/{pr_number}"

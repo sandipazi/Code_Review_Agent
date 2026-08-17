@@ -34,7 +34,7 @@ class OpenAIAdapter(BaseLLMAdapter):
         
         return LLMMessage(
             role=choice.get("role", "assistant"),
-            content=choice.get("content", ""),
+            content=choice.get("content") or "",
             tool_calls=choice.get("tool_calls")
         )
 

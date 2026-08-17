@@ -2,6 +2,7 @@ from typing import Dict, Any, List, Optional
 from adapters.vcs.base import BaseVCSAdapter
 from adapters.llm.base import BaseLLMAdapter, LLMMessage
 from core.mcp_client import InternalMCPClient
+from config.settings import settings
 import json
 import logging
 
@@ -38,6 +39,16 @@ class PRReviewAgent:
             logger.info("Empty PR diff, skipping review.")
             return
 
+        # 1b. Bound diff size so large PRs don't blow past provider token/size limits
+        diff_truncated = False
+        if len(diff_text) > settings.MAX_DIFF_CHARS:
+            diff_text = diff_text[: settings.MAX_DIFF_CHARS]
+            diff_truncated = True
+            logger.warning(
+                "PR #%d diff truncated to %d chars to stay within LLM payload limits",
+                pr_number, settings.MAX_DIFF_CHARS,
+            )
+
         # 2. Get available tools from MCP
         tools = self.mcp.get_tools()
 
@@ -47,6 +58,8 @@ class PRReviewAgent:
             try:
                 rag_context = self.rag.retrieve(diff_text, repo_name)
                 if rag_context:
+                    if len(rag_context) > settings.MAX_RAG_CONTEXT_CHARS:
+                        rag_context = rag_context[: settings.MAX_RAG_CONTEXT_CHARS]
                     logger.info("RAG context retrieved (%d chars) for PR #%d", len(rag_context), pr_number)
                 else:
                     logger.info("RAG returned no relevant context for PR #%d", pr_number)
@@ -82,9 +95,17 @@ class PRReviewAgent:
             "}\n"
         )
 
+        diff_truncation_note = (
+            f"\n\n[Note: diff truncated to {settings.MAX_DIFF_CHARS} characters to stay within "
+            "LLM provider limits; this review may not cover the full PR.]"
+            if diff_truncated else ""
+        )
         messages = [
             LLMMessage(role="system", content=system_prompt),
-            LLMMessage(role="user", content=f"Please review the following diff:\n\n```diff\n{diff_text}\n```"),
+            LLMMessage(
+                role="user",
+                content=f"Please review the following diff:\n\n```diff\n{diff_text}\n```{diff_truncation_note}",
+            ),
         ]
 
         # 5. Agent ReAct Loop

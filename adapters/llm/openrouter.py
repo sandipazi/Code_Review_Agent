@@ -6,15 +6,25 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class GroqAdapter(BaseLLMAdapter):
-    def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile"):
+class OpenRouterAdapter(BaseLLMAdapter):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "meta-llama/llama-3.3-70b-instruct",
+        site_url: Optional[str] = None,
+        app_name: Optional[str] = None,
+    ):
         self.api_key = api_key
         self.model = model
-        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
+        self.base_url = "https://openrouter.ai/api/v1/chat/completions"
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        if site_url:
+            self.headers["HTTP-Referer"] = site_url
+        if app_name:
+            self.headers["X-Title"] = app_name
         self.client = httpx.Client(headers=self.headers)
 
     def generate(self, messages: List[LLMMessage], tools: Optional[List[Dict[str, Any]]] = None) -> LLMMessage:
@@ -29,7 +39,7 @@ class GroqAdapter(BaseLLMAdapter):
         response = self.client.post(self.base_url, json=payload, timeout=60.0)
 
         if response.status_code != 200:
-            logger.error(f"Groq API error: {response.text}")
+            logger.error(f"OpenRouter API error: {response.text}")
             response.raise_for_status()
 
         data = response.json()
