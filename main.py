@@ -1,5 +1,5 @@
 # pyrefly: ignore [missing-import]
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 # pyrefly: ignore [missing-import]
 from fastapi.responses import JSONResponse
 # pyrefly: ignore [missing-import]
@@ -7,8 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import hmac
 import hashlib
+import threading
 from config.settings import settings
-from models.schemas import PullRequestEvent, ChatRequest, ChatResponse
+from models.schemas import PullRequestEvent, ChatRequest, ChatResponse, CancelReviewRequest
 from adapters.vcs.github import GitHubAdapter
 from adapters.llm.openai import OpenAIAdapter
 from core.agent import PRReviewAgent
@@ -159,15 +160,21 @@ def get_rag_components(vcs_adapter=None):
 
     return retriever, ingester
 
-def run_deep_review(repo_name: str, pr_number: int, github_token: Optional[str] = None):
-    """Background task to run the deep PR review."""
+def run_deep_review(
+    repo_name: str,
+    pr_number: int,
+    github_token: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
+):
+    """Runs the deep PR review. Invoked in its own daemon thread (see trigger_review_callback)
+    so multiple triggered reviews run truly in parallel rather than queuing."""
     logger.info(f"Starting background review for PR #{pr_number} in {repo_name}")
     try:
         vcs_adapter, llm_adapter = get_adapters(github_token)
-        
+
         # We need an MCP Client for the deep review as well
         mcp_server = MCPServer()
-        
+
         # Setup RAG
         rag_retriever, github_ingester = get_rag_components(vcs_adapter)
         if rag_retriever:
@@ -175,16 +182,20 @@ def run_deep_review(repo_name: str, pr_number: int, github_token: Optional[str] 
             mcp_server.register_rag_tools(rag_tools)
 
         mcp_client = InternalMCPClient(mcp_server)
-        
+
         agent = PRReviewAgent(
-            vcs_adapter=vcs_adapter, 
-            llm_adapter=llm_adapter, 
+            vcs_adapter=vcs_adapter,
+            llm_adapter=llm_adapter,
             mcp_client=mcp_client,
             rag_retriever=rag_retriever,
-            github_ingester=github_ingester
+            github_ingester=github_ingester,
+            cancel_event=cancel_event,
         )
         agent.review_pr(repo_name, pr_number)
-        review_job_store.mark_completed(repo_name, pr_number)
+        if cancel_event is not None and cancel_event.is_set():
+            review_job_store.mark_cancelled(repo_name, pr_number)
+        else:
+            review_job_store.mark_completed(repo_name, pr_number)
     except Exception as e:
         logger.error(f"Review failed: {e}")
         review_job_store.mark_failed(repo_name, pr_number, str(e))
@@ -196,7 +207,7 @@ def run_deep_review(repo_name: str, pr_number: int, github_token: Optional[str] 
             pass
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(chat_request: ChatRequest, request: Request, background_tasks: BackgroundTasks):
+async def chat_endpoint(chat_request: ChatRequest, request: Request):
     """
     Stateless conversational endpoint for HITL PR Review.
     Accepts a list of messages (full conversation history) and returns the updated history.
@@ -212,11 +223,16 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request, background_
         raise HTTPException(status_code=500, detail=str(e))
 
     def trigger_review_callback(repo_name: str, pr_number: int):
-        # Record the job as pending before scheduling so a client that polls
-        # /reviews/status immediately after this call sees "pending", not "unknown".
-        review_job_store.mark_pending(repo_name, pr_number)
-        # Spawn the deep review job in FastAPI background tasks
-        background_tasks.add_task(run_deep_review, repo_name, pr_number, github_token)
+        # Each review runs in its own daemon thread rather than FastAPI's BackgroundTasks —
+        # BackgroundTasks awaits every task registered on one request sequentially, which would
+        # serialize multiple reviews triggered in the same chat turn instead of running them
+        # in parallel.
+        cancel_event = review_job_store.mark_pending(repo_name, pr_number)
+        threading.Thread(
+            target=run_deep_review,
+            args=(repo_name, pr_number, github_token, cancel_event),
+            daemon=True,
+        ).start()
 
     try:
         # Build MCPServer and register github tools
@@ -288,6 +304,15 @@ async def review_status(repo_name: str, pr_number: int):
     """Check the status of a background PR review triggered via /chat's trigger_review tool."""
     job = review_job_store.get(repo_name, pr_number)
     return JSONResponse(job or {"status": "unknown"})
+
+@app.post("/reviews/cancel")
+async def cancel_review(payload: CancelReviewRequest):
+    """Cooperatively cancel a running PR review. Takes effect at the next ReAct-loop
+    checkpoint, not instantly — the job may still finish if it was already about to."""
+    found = review_job_store.request_cancel(payload.repo_name, payload.pr_number)
+    if not found:
+        raise HTTPException(status_code=404, detail="No review job found for that repo/PR.")
+    return JSONResponse({"status": "cancelling"})
 
 @app.post("/webhook")
 async def github_webhook(request: Request):

@@ -27,3 +27,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     messages: List[Dict[str, Any]]
+
+class CancelReviewRequest(BaseModel):
+    repo_name: str
+    pr_number: int
