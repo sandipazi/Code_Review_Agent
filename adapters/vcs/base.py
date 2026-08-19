@@ -1,5 +1,16 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+
+class VCSPermissionError(Exception):
+    """Raised when the VCS provider rejects a write operation (401/403) — almost
+    always means the supplied token lacks the required scope, not a transient error."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None, detail: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
+
 
 class BaseVCSAdapter(ABC):
     @abstractmethod
@@ -10,6 +21,11 @@ class BaseVCSAdapter(ABC):
     @abstractmethod
     def list_pull_requests(self, repo_name: str, state: str = "open") -> List[Dict[str, Any]]:
         """List pull requests for a repository."""
+        pass
+
+    @abstractmethod
+    def list_repositories(self) -> List[Dict[str, Any]]:
+        """List repositories accessible to the authenticated token."""
         pass
 
     @abstractmethod
@@ -25,4 +41,19 @@ class BaseVCSAdapter(ABC):
     @abstractmethod
     def post_inline_comment(self, repo_name: str, pr_number: int, commit_id: str, path: str, line: int, comment: str) -> None:
         """Post an inline comment on a specific line of code in a file."""
+        pass
+
+    @abstractmethod
+    def get_review_comments(self, repo_name: str, pr_number: int) -> List[Dict[str, Any]]:
+        """Fetch all review comments (inline + general) for a pull request."""
+        pass
+
+    @abstractmethod
+    def list_files(self, repo_name: str, branch: str = "main", path: str = "") -> List[Any]:
+        """List files in a repository at a given branch and directory path."""
+        pass
+
+    @abstractmethod
+    def read_file(self, repo_name: str, file_path: str, branch: str = "main") -> str:
+        """Fetch the raw content of a file from the repository."""
         pass

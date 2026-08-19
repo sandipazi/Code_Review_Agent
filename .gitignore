@@ -1,3 +1,6 @@
 __pycache__
 venv
 .env
+*.bin
+
+.rag_db

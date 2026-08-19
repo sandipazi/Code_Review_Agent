@@ -1,42 +1,122 @@
-from typing import Dict, Any, List
+from typing import Dict, Any, Callable, List, Optional
 from adapters.vcs.base import BaseVCSAdapter
 from adapters.llm.base import BaseLLMAdapter, LLMMessage
 from core.mcp_client import InternalMCPClient
+from config.settings import settings
+import concurrent.futures
 import json
 import logging
 
 logger = logging.getLogger(__name__)
 
+# How often to poll the in-flight LLM call and re-emit a heartbeat while waiting.
+# Must stay comfortably below Temporal's heartbeat_timeout (core/temporal_workflows.py)
+# so a single slow LLM call (up to ~120s worst case through the provider fallback
+# chain) doesn't trip a false-positive activity timeout.
+HEARTBEAT_POLL_INTERVAL_SECONDS = 10
+
+
 class PRReviewAgent:
-    def __init__(self, vcs_adapter: BaseVCSAdapter, llm_adapter: BaseLLMAdapter, mcp_client: InternalMCPClient):
+    def __init__(
+        self,
+        vcs_adapter: BaseVCSAdapter,
+        llm_adapter: BaseLLMAdapter,
+        mcp_client: InternalMCPClient,
+        rag_retriever=None,       # Optional[RAGRetriever] — avoids circular import
+        github_ingester=None,     # Optional[GitHubIngester] — for auto-ingest post-review
+        heartbeat: Optional[Callable[[], None]] = None,  # called each loop iteration; may raise to abort
+    ):
         self.vcs = vcs_adapter
         self.llm = llm_adapter
         self.mcp = mcp_client
+        self.rag = rag_retriever        # None → RAG disabled, fully backward-compatible
+        self.ingester = github_ingester # None → auto-ingest disabled
+        self.heartbeat = heartbeat
         self.max_loops = 5
+        self._llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def _run_with_heartbeat(self, fn: Callable, *args, **kwargs):
+        """Runs fn(*args, **kwargs) on a worker thread and heartbeats every
+        HEARTBEAT_POLL_INTERVAL_SECONDS while it's in flight, instead of only once
+        before the call. Used for every potentially-slow, network-bound step in
+        review_pr() (LLM generate, RAG retrieve, RAG auto-ingest) — any one of these
+        can legitimately take longer than a single heartbeat interval (e.g. an LLM
+        fallback chain, or a cold-start embedding-model download from Hugging Face),
+        which would otherwise sit past Temporal's heartbeat_timeout with no heartbeat
+        sent and get marked failed/timed-out even after the real work succeeded."""
+        future = self._llm_executor.submit(fn, *args, **kwargs)
+        while True:
+            try:
+                return future.result(timeout=HEARTBEAT_POLL_INTERVAL_SECONDS)
+            except concurrent.futures.TimeoutError:
+                if self.heartbeat is not None:
+                    self.heartbeat()  # raises if Temporal has requested cancellation
 
     def review_pr(self, repo_name: str, pr_number: int):
         logger.info(f"Starting agent loop for PR #{pr_number} in {repo_name}")
-        
+
         # 1. Fetch Diff
         try:
             diff_text = self.vcs.get_pull_request_diff(repo_name, pr_number)
         except Exception as e:
             logger.error(f"Failed to fetch PR diff: {e}")
             return
-            
+
         if not diff_text:
             logger.info("Empty PR diff, skipping review.")
             return
 
+        # 1b. Bound diff size so large PRs don't blow past provider token/size limits
+        diff_truncated = False
+        if len(diff_text) > settings.MAX_DIFF_CHARS:
+            diff_text = diff_text[: settings.MAX_DIFF_CHARS]
+            diff_truncated = True
+            logger.warning(
+                "PR #%d diff truncated to %d chars to stay within LLM payload limits",
+                pr_number, settings.MAX_DIFF_CHARS,
+            )
+
         # 2. Get available tools from MCP
         tools = self.mcp.get_tools()
 
-        # 3. Setup Initial Prompt
+        # 3. Retrieve RAG context (if retriever is configured)
+        # Heartbeat-wrapped: on a cold start this can trigger a lazy embedding-model
+        # load/download (see LocalEmbedder._load) that's slow enough to blow past
+        # Temporal's heartbeat_timeout on its own, before the review even starts.
+        rag_context = ""
+        if self.rag is not None:
+            try:
+                rag_context = self._run_with_heartbeat(self.rag.retrieve, diff_text, repo_name)
+                if rag_context:
+                    if len(rag_context) > settings.MAX_RAG_CONTEXT_CHARS:
+                        rag_context = rag_context[: settings.MAX_RAG_CONTEXT_CHARS]
+                    logger.info("RAG context retrieved (%d chars) for PR #%d", len(rag_context), pr_number)
+                else:
+                    logger.info("RAG returned no relevant context for PR #%d", pr_number)
+            except Exception as exc:
+                logger.warning("RAG retrieval failed (review will continue without it): %s", exc)
+
+        # 4. Build System Prompt — inject RAG context if available
         system_prompt = (
             "You are an expert AI software engineer and code reviewer.\n"
-            "Review the provided pull request diff. Look for bugs, anti-patterns, and readability issues.\n"
+            "Review the provided pull request diff. Look for bugs, anti-patterns, security issues, "
+            "and readability problems.\n"
             "You can use tools to read the full context of files if the diff isn't enough.\n"
-            "When you are done reviewing, reply with your final review in the following JSON format ONLY:\n"
+            "You can also use the `search_knowledge_base` tool to find relevant past reviews, "
+            "project conventions, or similar patterns from the codebase history.\n"
+        )
+
+        if rag_context:
+            system_prompt += (
+                "\nThe following context was automatically retrieved from the project knowledge base "
+                "to help you give a more informed review. Use it to check for recurring patterns, "
+                "enforce project conventions, and reference historical decisions:\n"
+                + rag_context
+                + "\n"
+            )
+
+        system_prompt += (
+            "\nWhen you are done reviewing, reply with your final review in the following JSON format ONLY:\n"
             "{\n"
             "  \"general_comment\": \"Overall feedback on the PR\",\n"
             "  \"inline_comments\": [\n"
@@ -44,78 +124,127 @@ class PRReviewAgent:
             "  ]\n"
             "}\n"
         )
-        
+
+        diff_truncation_note = (
+            f"\n\n[Note: diff truncated to {settings.MAX_DIFF_CHARS} characters to stay within "
+            "LLM provider limits; this review may not cover the full PR.]"
+            if diff_truncated else ""
+        )
         messages = [
             LLMMessage(role="system", content=system_prompt),
-            LLMMessage(role="user", content=f"Please review the following diff:\n\n```diff\n{diff_text}\n```")
+            LLMMessage(
+                role="user",
+                content=f"Please review the following diff:\n\n```diff\n{diff_text}\n```{diff_truncation_note}",
+            ),
         ]
 
-        # 4. Agent Loop
-        for i in range(self.max_loops):
-            logger.info(f"Agent loop iteration {i+1}/{self.max_loops}")
-            response = self.llm.generate(messages, tools=tools)
-            
-            if response.tool_calls:
-                messages.append(response) # Add assistant's tool call message
-                
-                # Execute tools sequentially
-                for tool_call in response.tool_calls:
-                    tool_id = tool_call.get("id")
-                    func_call = tool_call.get("function", {})
-                    name = func_call.get("name")
-                    try:
-                        args = json.loads(func_call.get("arguments", "{}"))
-                    except json.JSONDecodeError:
-                        args = {}
-                    
-                    logger.info(f"LLM called tool: {name} with {args}")
-                    
-                    # Call MCP Client
-                    tool_result = self.mcp.call_tool(name, args)
-                    
-                    # Append result as a tool role message
-                    messages.append(
-                        LLMMessage(
-                            role="tool", 
-                            content=str(tool_result),
-                            tool_call_id=tool_id,
-                            name=name
+        # 5. Agent ReAct Loop
+        final_review_data: Optional[dict] = None
+        try:
+            for i in range(self.max_loops):
+                if self.heartbeat is not None:
+                    self.heartbeat()  # e.g. Temporal's activity.heartbeat — raises if cancelled
+
+                logger.info(f"Agent loop iteration {i+1}/{self.max_loops}")
+                response = self._run_with_heartbeat(self.llm.generate, messages, tools=tools)
+
+                if response.tool_calls:
+                    messages.append(response)  # Add assistant's tool call message
+
+                    # Execute tools sequentially
+                    for tool_call in response.tool_calls:
+                        tool_id = tool_call.get("id")
+                        func_call = tool_call.get("function", {})
+                        name = func_call.get("name")
+                        try:
+                            args = json.loads(func_call.get("arguments", "{}"))
+                        except json.JSONDecodeError:
+                            args = {}
+
+                        logger.info(f"LLM called tool: {name} with {args}")
+                        tool_result = self.mcp.call_tool(name, args)
+
+                        messages.append(
+                            LLMMessage(
+                                role="tool",
+                                content=str(tool_result),
+                                tool_call_id=tool_id,
+                                name=name,
+                            )
                         )
-                    )
+                else:
+                    # No tool calls — this is the final response
+                    final_content = response.content
+                    final_review_data = self._process_final_review(repo_name, pr_number, final_content)
+                    break
             else:
-                # No tool calls, this is the final response
-                final_content = response.content
-                self._process_final_review(repo_name, pr_number, final_content)
-                break
-        else:
-            logger.warning("Max loops reached, agent did not finish tool execution properly.")
-            self._process_final_review(repo_name, pr_number, messages[-1].content)
-            
-    def _process_final_review(self, repo_name: str, pr_number: int, content: str):
+                logger.warning("Max loops reached, agent did not finish tool execution properly.")
+                final_review_data = self._process_final_review(repo_name, pr_number, messages[-1].content)
+
+            # 6. Auto-ingest the completed review back into the vector store.
+            # Heartbeat-wrapped for the same reason as step 3 — this triggers the same
+            # embedder, and on a cold worker it's often the *first* place the model
+            # download happens (after the review already succeeded), so it must stay
+            # heartbeat-covered too or Temporal can mark an already-successful review
+            # as failed/timed-out.
+            if final_review_data and self.ingester is not None:
+                try:
+                    self._run_with_heartbeat(
+                        self.ingester.ingest_review_result,
+                        repo_name=repo_name,
+                        pr_number=pr_number,
+                        general_comment=final_review_data.get("general_comment", ""),
+                        inline_comments=final_review_data.get("inline_comments", []),
+                        pr_outcome="reviewed",
+                    )
+                except Exception as exc:
+                    logger.warning("Auto-ingest of review failed (non-critical): %s", exc)
+        finally:
+            # wait=False: if a call is still in flight (e.g. we bailed out via a
+            # cancellation raised from heartbeat()), the underlying call can't be
+            # interrupted — don't block this thread waiting for it to finish.
+            self._llm_executor.shutdown(wait=False)
+
+    def _process_final_review(self, repo_name: str, pr_number: int, content: str) -> Optional[dict]:
+        """
+        Parse the LLM's JSON review output, post it to GitHub, and return
+        the parsed dict so the caller can auto-ingest it. Returns None on failure.
+        """
         try:
             clean_content = content.strip()
             if clean_content.startswith("```json"):
                 clean_content = clean_content[7:]
             if clean_content.endswith("```"):
                 clean_content = clean_content[:-3]
-                
+
             review_data = json.loads(clean_content.strip())
-            
+
             general = review_data.get("general_comment")
             if general:
-                self.vcs.post_review_comment(repo_name, pr_number, general)
-                
+                try:
+                    self.vcs.post_review_comment(repo_name, pr_number, general)
+                except Exception as e:
+                    logger.error(f"Failed to post review comment for PR #{pr_number} in {repo_name}: {e}")
+                    raise
+
             inline_comments = review_data.get("inline_comments", [])
             for c in inline_comments:
                 # NOTE: Real inline comments on GitHub require complex diff parsing
                 # to map the PR lines to commit side (RIGHT vs LEFT) and position.
-                # For this proof of concept, we just log it or you could post it as general.
+                # For this proof of concept, we just log it or post as general.
                 path = c.get("path")
                 line = c.get("line")
                 comment = c.get("comment")
                 logger.info(f"Prepared inline comment for {path}:{line} - {comment}")
-                
+
+            return review_data
+
         except json.JSONDecodeError:
             logger.error(f"Failed to parse LLM JSON output. Raw output: {content}")
-            # Fallback: Just post the raw text as a general comment
-            self.vcs.post_review_comment(repo_name, pr_number, content)
+            # Fallback: post the raw text as a general comment
+            try:
+                self.vcs.post_review_comment(repo_name, pr_number, content)
+            except Exception as e:
+                logger.error(f"Failed to post fallback review comment for PR #{pr_number} in {repo_name}: {e}")
+                raise
+            return None

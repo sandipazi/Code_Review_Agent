@@ -1,9 +1,29 @@
 import httpx
 from typing import List, Dict, Any
-from .base import BaseVCSAdapter
+from .base import BaseVCSAdapter, VCSPermissionError
 import logging
 
 logger = logging.getLogger(__name__)
+
+_PERMISSION_ERROR_HINT = (
+    "GitHub rejected posting a comment to {repo}#{pr} ({status}). The provided token "
+    "likely lacks the required scope — for classic PATs it needs the `repo` scope; for "
+    "fine-grained PATs it needs 'Pull requests: write' and 'Issues: write' on this "
+    "repository. Update the token and re-trigger the review."
+)
+
+
+def _raise_for_status_with_permission_check(response: httpx.Response, repo_name: str, pr_number: int) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            raise VCSPermissionError(
+                _PERMISSION_ERROR_HINT.format(repo=repo_name, pr=pr_number, status=e.response.status_code),
+                status_code=e.response.status_code,
+                detail=e.response.text,
+            ) from e
+        raise
 
 class GitHubAdapter(BaseVCSAdapter):
     def __init__(self, token: str):
@@ -36,6 +56,15 @@ class GitHubAdapter(BaseVCSAdapter):
         response.raise_for_status()
         return response.json()
 
+    def list_repositories(self) -> List[Dict[str, Any]]:
+        """List repositories accessible to the authenticated token (first page, most-recently updated first)."""
+        response = self.client.get(
+            "/user/repos",
+            params={"per_page": 100, "sort": "updated"}
+        )
+        response.raise_for_status()
+        return response.json()
+
     def get_pull_request_metadata(self, repo_name: str, pr_number: int) -> Dict[str, Any]:
         response = self.client.get(
             f"/repos/{repo_name}/pulls/{pr_number}"
@@ -48,7 +77,7 @@ class GitHubAdapter(BaseVCSAdapter):
             f"/repos/{repo_name}/issues/{pr_number}/comments",
             json={"body": comment}
         )
-        response.raise_for_status()
+        _raise_for_status_with_permission_check(response, repo_name, pr_number)
         logger.info(f"Posted review comment to PR #{pr_number}")
 
     def post_inline_comment(self, repo_name: str, pr_number: int, commit_id: str, path: str, line: int, comment: str) -> None:
@@ -61,8 +90,47 @@ class GitHubAdapter(BaseVCSAdapter):
                 "line": line
             }
         )
-        response.raise_for_status()
+        _raise_for_status_with_permission_check(response, repo_name, pr_number)
         logger.info(f"Posted inline comment to {path}:{line} on PR #{pr_number}")
 
     def close(self):
         self.client.close()
+
+    def get_review_comments(self, repo_name: str, pr_number: int) -> List[Dict[str, Any]]:
+        """Fetch all inline review comments for a pull request."""
+        response = self.client.get(
+            f"/repos/{repo_name}/pulls/{pr_number}/comments"
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def list_files(self, repo_name: str, branch: str = "main", path: str = "") -> List[Dict[str, Any]]:
+        """
+        List files in a repository at a specific branch using the Git Trees API.
+        Returns a flat list of file dicts with 'path' and 'type' keys.
+        For large repos, the tree is returned recursively (up to GitHub's limit).
+        """
+        url = f"/repos/{repo_name}/git/trees/{branch}"
+        response = self.client.get(url, params={"recursive": "1"})
+        response.raise_for_status()
+        data = response.json()
+        # Filter to blobs (files) only, optionally under `path` prefix
+        items = [
+            {"path": item["path"], "type": "file", "size": item.get("size", 0)}
+            for item in data.get("tree", [])
+            if item["type"] == "blob" and item["path"].startswith(path)
+        ]
+        return items
+
+    def read_file(self, repo_name: str, file_path: str, branch: str = "main") -> str:
+        """
+        Fetch the raw content of a file from a GitHub repository.
+        Uses the raw content endpoint for efficiency.
+        """
+        response = self.client.get(
+            f"/repos/{repo_name}/contents/{file_path}",
+            params={"ref": branch},
+            headers={**self.headers, "Accept": "application/vnd.github.v3.raw"},
+        )
+        response.raise_for_status()
+        return response.text

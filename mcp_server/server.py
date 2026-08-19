@@ -68,6 +68,40 @@ class MCPServer:
                 }
             }
         ])
+
+    def register_rag_tools(self, rag_tools):
+        """Register the RAG knowledge-base search tool (only when RAG is enabled)."""
+        self.tools["search_knowledge_base"] = rag_tools.search_knowledge_base
+
+        self.tool_schemas.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_knowledge_base",
+                    "description": (
+                        "Search the project's internal knowledge base for relevant context: "
+                        "past PR review comments, historical bug patterns, coding conventions, "
+                        "architectural documentation, and approved code patterns. "
+                        "Use this when the diff alone doesn't provide enough context for a "
+                        "thorough review."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Natural language or code search query.",
+                            },
+                            "repo_name": {
+                                "type": "string",
+                                "description": "Full repository name (e.g. 'owner/repo'). Optional.",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                },
+            }
+        )
         
     def get_tool_schemas(self) -> list[Dict[str, Any]]:
         """Return tool schemas in OpenAI function calling format."""
