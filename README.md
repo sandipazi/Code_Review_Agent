@@ -42,6 +42,7 @@ Code_Review_Agent/
    ```
 4. **Environment Variables**
    - Copy `.env.example` to `.env` and configure your API keys (LLM, GitHub App / PAT).
+   - See [GitHub Token Permissions](#github-token-permissions) below for the exact scopes your PAT needs — an under-scoped token is the most common reason a review silently fails.
 5. **Run Temporal (durable PR review execution)**
 
    PR reviews run as Temporal workflows, so a Temporal server and a Worker must be running before you trigger a review. Install the [Temporal CLI](https://docs.temporal.io/cli) if you don't have it, then in two separate terminals:
@@ -65,6 +66,52 @@ Code_Review_Agent/
    python mcp_runner.py --github-token YOUR_GITHUB_PAT
    ```
    *Check `docs/client_configs/` for integration examples.*
+
+## GitHub Token Permissions
+
+The agent needs a GitHub Personal Access Token (PAT) — either set as `GITHUB_TOKEN` in
+`.env`, or supplied per-request via the `X-GitHub-Token` header / the frontend's connect
+screen. **The token must have write access to pull requests/issues on the target
+repositories**, not just read access — the agent fetches diffs (read) but also posts the
+review back as a comment (write). A read-only token will let a review run to completion
+and then fail silently at the very last step with a `403 Forbidden` when posting the
+comment.
+
+Create the token at [github.com/settings/tokens](https://github.com/settings/tokens) with
+one of:
+
+- **Fine-grained PAT** (recommended — scoped to specific repos):
+  - Repository access: select the specific repositories the agent should review.
+  - Repository permissions:
+    - **Pull requests: Read and write**
+    - **Issues: Read and write** (PR review comments are posted via the Issues comments API)
+    - **Contents: Read-only** (needed to fetch diffs/files)
+    - **Metadata: Read-only** (required by default for any fine-grained token)
+- **Classic PAT** (simpler, but repo-wide):
+  - Scope: **`repo`** (full control of private repositories — includes PR/issue read+write). If you only need public repos, `public_repo` is sufficient instead of the full `repo` scope.
+
+Without these, `/reviews/status` will report the review as `failed` with an error message
+naming the exact missing scope.
+
+## Hugging Face Token (Optional — for local RAG embeddings)
+
+By default (`RAG_EMBEDDER=local`), the RAG knowledge base embeds text locally using the
+`all-MiniLM-L6-v2` model, which `worker.py` downloads from the Hugging Face Hub the first
+time it's needed. Without a token, these requests are unauthenticated and can be slow or
+rate-limited — slow enough, on a cold worker, to make an otherwise-successful PR review
+look like it failed (see the `Warning: You are sending unauthenticated requests to the HF
+Hub` line in the worker logs).
+
+To avoid this, generate a free token and make it available to the worker process:
+
+1. Create a Hugging Face account, then go to [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and click **New token**.
+2. Give it any name (e.g. `code-review-agent`), set the role to **Read** (you're only downloading a public model, never uploading), and click **Create token**. Copy the generated token (starts with `hf_`).
+3. Make it available to whichever process downloads the model:
+   - **Recommended**: `pip install huggingface_hub[cli]` then run `huggingface-cli login` and paste the token. This caches it at `~/.cache/huggingface/token` and every process (worker, `scripts/ingest.py`, etc.) picks it up automatically — no further config needed.
+   - **Alternative**: export it as a real shell environment variable before starting the worker, e.g. `export HF_TOKEN=hf_xxx` (or add that line to your shell profile). Note that adding `HF_TOKEN=...` to this project's `.env` file alone is **not** enough for `main.py`/`worker.py` — those load `.env` only into typed config values via `pydantic-settings` (`config/settings.py`), not into the process environment, so `huggingface_hub` won't see it there. (`scripts/ingest.py` is the one exception — it calls `load_dotenv()`, so `.env` does work for that script specifically.)
+
+This step is optional — reviews work without it — but it removes one of the slowest,
+least predictable parts of a cold-start review.
 
 ## Contributing
 Please refer to `Architecture.md` to understand the internal component structure before making significant changes to the agent loop or MCP pipeline.

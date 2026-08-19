@@ -13,6 +13,14 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "all-MiniLM-L6-v2"
 
+# Process-wide cache of loaded SentenceTransformer models, keyed by model name.
+# A fresh LocalEmbedder is constructed on every single review activity
+# (core/adapter_factory.py: get_rag_components), so without this cache each review
+# would re-touch the Hugging Face Hub (cache-validation HEAD requests at minimum,
+# a full model download on a cold worker) even though the underlying model object
+# is identical every time within this process.
+_MODEL_CACHE: dict = {}
+
 
 class LocalEmbedder(BaseEmbedder):
     """
@@ -22,7 +30,7 @@ class LocalEmbedder(BaseEmbedder):
 
     def __init__(self, model_name: str = DEFAULT_MODEL):
         self._model_name = model_name
-        self._model = None  # lazy load
+        self._model = _MODEL_CACHE.get(model_name)  # reuse if already loaded in this process
         logger.info("LocalEmbedder configured with model '%s' (lazy load)", model_name)
 
     def _load(self):
@@ -36,6 +44,7 @@ class LocalEmbedder(BaseEmbedder):
                 ) from exc
             logger.info("Loading sentence-transformer model '%s'...", self._model_name)
             self._model = SentenceTransformer(self._model_name)
+            _MODEL_CACHE[self._model_name] = self._model
             logger.info("Model loaded. Vector size: %d", self.vector_size)
 
     def embed(self, texts: list[str]) -> list[list[float]]:

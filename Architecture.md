@@ -11,24 +11,35 @@ graph TD
     User([User / Frontend]) -->|Stateless Chat History| A(FastAPI /chat)
     IDE([IDE / Claude Desktop]) -->|stdio| M2[mcp_runner.py]
     RemoteAgent([Remote Agent]) -->|HTTP JSON-RPC| A
-    
+
     A --> B[Chat Agent Loop]
     A --> M1[MCP HTTP Transport]
-    
+
     B -->|Tool: list_prs, trigger_review| C[MCP Client]
     C --> D[MCP Server Core]
     M1 --> D
     M2 -->|MCP SDK Wrapper| D
-    
-    D -->|trigger_review| E[BackgroundTasks Job]
-    E -->|Start| F[PR Review Agent]
-    
+
+    D -->|trigger_review| W[Temporal Workflow]
+    W -.->|polled by| N[Worker Process worker.py]
+    N -->|Runs| F[PR Review Agent]
+
     F -->|Fetch Diff| G[VCS Adapter]
     F -->|System Prompt & Diff| H[LLM Adapter]
     H -->|Review Feedback| F
     F -->|Inline Comments| G
     G -->|Post Comments| I[VCS Provider]
+
+    User -.->|Poll /reviews/status| A
+    A -.->|describe/result| W
 ```
+
+**Note on the trigger path**: there is no direct REST endpoint to trigger a review.
+It's conversational — the user asks the Chat Agent to review a PR, the LLM calls
+the `trigger_review` MCP tool, and `main.py:_start_review_workflow` starts a
+durable Temporal workflow (`PRReviewWorkflow`, `core/temporal_workflows.py`). The
+workflow itself only executes once a separate `worker.py` process (registered
+against the same task queue) picks it up — see "Execution Model" below.
 
 ## Architectural Components
 
@@ -58,3 +69,35 @@ graph TD
 ### 6. Adapter Layer
 - **VCS Adapters** (`adapters/vcs/`): Interfaces for interacting with repositories (GitHub, GitLab).
 - **LLM Adapters** (`adapters/llm/`): Interfaces for executing prompts and generating responses (OpenAI, Anthropic, Gemini, GitHub Models).
+
+## Execution Model: Temporal Workflow, Not In-Process Background Tasks
+
+Deep reviews used to run as an in-process daemon thread per review
+(`core/review_jobs.py`, now removed). They now run as a **durable Temporal
+workflow** (`core/temporal_workflows.py: PRReviewWorkflow`), which requires
+**three separate processes** to be running (see `README.md` Setup for exact
+commands):
+
+1. **The FastAPI app** (`main.py`) — serves `/chat`, `/reviews/status`, `/reviews/cancel`.
+2. **A Temporal server** (e.g. `temporal server start-dev`) — durable workflow/activity state.
+3. **The worker process** (`worker.py`) — polls the task queue and actually executes
+   `run_review_activity` (which builds the adapters and runs `PRReviewAgent.review_pr`).
+
+If either the Temporal server or `worker.py` isn't running, `main.py` can still
+successfully *start* a workflow (step 1 above succeeds), but it will never
+progress past "pending" — nothing is wrong, there's just no worker consuming the
+queue. `/reviews/status` distinguishes this from other failure modes:
+
+| `/reviews/status` value | Meaning |
+|---|---|
+| `pending` | Workflow is running (or queued with no worker consuming it yet) |
+| `completed` | Review finished and the comment was posted |
+| `failed` | Workflow failed — `error` carries the unwrapped cause (e.g. a GitHub permission error from an under-scoped token) |
+| `cancelled` | Review was cancelled via `/reviews/cancel` |
+| `unreachable` | The FastAPI process can't reach the Temporal server at all |
+| `not_found` | No workflow exists for this repo/PR — it was never triggered, or the trigger itself failed before the workflow started |
+| `error` | Some other error occurred fetching status |
+
+There is no push/webhook notification for completion — the frontend
+(`SessionReviewWatcher.tsx`) polls `/reviews/status` every few seconds until a
+terminal status is reached.

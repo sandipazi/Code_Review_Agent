@@ -1,5 +1,16 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+
+class VCSPermissionError(Exception):
+    """Raised when the VCS provider rejects a write operation (401/403) — almost
+    always means the supplied token lacks the required scope, not a transient error."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None, detail: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
+
 
 class BaseVCSAdapter(ABC):
     @abstractmethod

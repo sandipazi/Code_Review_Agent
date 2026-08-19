@@ -3,10 +3,17 @@ from adapters.vcs.base import BaseVCSAdapter
 from adapters.llm.base import BaseLLMAdapter, LLMMessage
 from core.mcp_client import InternalMCPClient
 from config.settings import settings
+import concurrent.futures
 import json
 import logging
 
 logger = logging.getLogger(__name__)
+
+# How often to poll the in-flight LLM call and re-emit a heartbeat while waiting.
+# Must stay comfortably below Temporal's heartbeat_timeout (core/temporal_workflows.py)
+# so a single slow LLM call (up to ~120s worst case through the provider fallback
+# chain) doesn't trip a false-positive activity timeout.
+HEARTBEAT_POLL_INTERVAL_SECONDS = 10
 
 
 class PRReviewAgent:
@@ -26,6 +33,24 @@ class PRReviewAgent:
         self.ingester = github_ingester # None → auto-ingest disabled
         self.heartbeat = heartbeat
         self.max_loops = 5
+        self._llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def _run_with_heartbeat(self, fn: Callable, *args, **kwargs):
+        """Runs fn(*args, **kwargs) on a worker thread and heartbeats every
+        HEARTBEAT_POLL_INTERVAL_SECONDS while it's in flight, instead of only once
+        before the call. Used for every potentially-slow, network-bound step in
+        review_pr() (LLM generate, RAG retrieve, RAG auto-ingest) — any one of these
+        can legitimately take longer than a single heartbeat interval (e.g. an LLM
+        fallback chain, or a cold-start embedding-model download from Hugging Face),
+        which would otherwise sit past Temporal's heartbeat_timeout with no heartbeat
+        sent and get marked failed/timed-out even after the real work succeeded."""
+        future = self._llm_executor.submit(fn, *args, **kwargs)
+        while True:
+            try:
+                return future.result(timeout=HEARTBEAT_POLL_INTERVAL_SECONDS)
+            except concurrent.futures.TimeoutError:
+                if self.heartbeat is not None:
+                    self.heartbeat()  # raises if Temporal has requested cancellation
 
     def review_pr(self, repo_name: str, pr_number: int):
         logger.info(f"Starting agent loop for PR #{pr_number} in {repo_name}")
@@ -55,10 +80,13 @@ class PRReviewAgent:
         tools = self.mcp.get_tools()
 
         # 3. Retrieve RAG context (if retriever is configured)
+        # Heartbeat-wrapped: on a cold start this can trigger a lazy embedding-model
+        # load/download (see LocalEmbedder._load) that's slow enough to blow past
+        # Temporal's heartbeat_timeout on its own, before the review even starts.
         rag_context = ""
         if self.rag is not None:
             try:
-                rag_context = self.rag.retrieve(diff_text, repo_name)
+                rag_context = self._run_with_heartbeat(self.rag.retrieve, diff_text, repo_name)
                 if rag_context:
                     if len(rag_context) > settings.MAX_RAG_CONTEXT_CHARS:
                         rag_context = rag_context[: settings.MAX_RAG_CONTEXT_CHARS]
@@ -112,58 +140,70 @@ class PRReviewAgent:
 
         # 5. Agent ReAct Loop
         final_review_data: Optional[dict] = None
-        for i in range(self.max_loops):
-            if self.heartbeat is not None:
-                self.heartbeat()  # e.g. Temporal's activity.heartbeat — raises if cancelled
+        try:
+            for i in range(self.max_loops):
+                if self.heartbeat is not None:
+                    self.heartbeat()  # e.g. Temporal's activity.heartbeat — raises if cancelled
 
-            logger.info(f"Agent loop iteration {i+1}/{self.max_loops}")
-            response = self.llm.generate(messages, tools=tools)
+                logger.info(f"Agent loop iteration {i+1}/{self.max_loops}")
+                response = self._run_with_heartbeat(self.llm.generate, messages, tools=tools)
 
-            if response.tool_calls:
-                messages.append(response)  # Add assistant's tool call message
+                if response.tool_calls:
+                    messages.append(response)  # Add assistant's tool call message
 
-                # Execute tools sequentially
-                for tool_call in response.tool_calls:
-                    tool_id = tool_call.get("id")
-                    func_call = tool_call.get("function", {})
-                    name = func_call.get("name")
-                    try:
-                        args = json.loads(func_call.get("arguments", "{}"))
-                    except json.JSONDecodeError:
-                        args = {}
+                    # Execute tools sequentially
+                    for tool_call in response.tool_calls:
+                        tool_id = tool_call.get("id")
+                        func_call = tool_call.get("function", {})
+                        name = func_call.get("name")
+                        try:
+                            args = json.loads(func_call.get("arguments", "{}"))
+                        except json.JSONDecodeError:
+                            args = {}
 
-                    logger.info(f"LLM called tool: {name} with {args}")
-                    tool_result = self.mcp.call_tool(name, args)
+                        logger.info(f"LLM called tool: {name} with {args}")
+                        tool_result = self.mcp.call_tool(name, args)
 
-                    messages.append(
-                        LLMMessage(
-                            role="tool",
-                            content=str(tool_result),
-                            tool_call_id=tool_id,
-                            name=name,
+                        messages.append(
+                            LLMMessage(
+                                role="tool",
+                                content=str(tool_result),
+                                tool_call_id=tool_id,
+                                name=name,
+                            )
                         )
-                    )
+                else:
+                    # No tool calls — this is the final response
+                    final_content = response.content
+                    final_review_data = self._process_final_review(repo_name, pr_number, final_content)
+                    break
             else:
-                # No tool calls — this is the final response
-                final_content = response.content
-                final_review_data = self._process_final_review(repo_name, pr_number, final_content)
-                break
-        else:
-            logger.warning("Max loops reached, agent did not finish tool execution properly.")
-            final_review_data = self._process_final_review(repo_name, pr_number, messages[-1].content)
+                logger.warning("Max loops reached, agent did not finish tool execution properly.")
+                final_review_data = self._process_final_review(repo_name, pr_number, messages[-1].content)
 
-        # 6. Auto-ingest the completed review back into the vector store
-        if final_review_data and self.ingester is not None:
-            try:
-                self.ingester.ingest_review_result(
-                    repo_name=repo_name,
-                    pr_number=pr_number,
-                    general_comment=final_review_data.get("general_comment", ""),
-                    inline_comments=final_review_data.get("inline_comments", []),
-                    pr_outcome="reviewed",
-                )
-            except Exception as exc:
-                logger.warning("Auto-ingest of review failed (non-critical): %s", exc)
+            # 6. Auto-ingest the completed review back into the vector store.
+            # Heartbeat-wrapped for the same reason as step 3 — this triggers the same
+            # embedder, and on a cold worker it's often the *first* place the model
+            # download happens (after the review already succeeded), so it must stay
+            # heartbeat-covered too or Temporal can mark an already-successful review
+            # as failed/timed-out.
+            if final_review_data and self.ingester is not None:
+                try:
+                    self._run_with_heartbeat(
+                        self.ingester.ingest_review_result,
+                        repo_name=repo_name,
+                        pr_number=pr_number,
+                        general_comment=final_review_data.get("general_comment", ""),
+                        inline_comments=final_review_data.get("inline_comments", []),
+                        pr_outcome="reviewed",
+                    )
+                except Exception as exc:
+                    logger.warning("Auto-ingest of review failed (non-critical): %s", exc)
+        finally:
+            # wait=False: if a call is still in flight (e.g. we bailed out via a
+            # cancellation raised from heartbeat()), the underlying call can't be
+            # interrupted — don't block this thread waiting for it to finish.
+            self._llm_executor.shutdown(wait=False)
 
     def _process_final_review(self, repo_name: str, pr_number: int, content: str) -> Optional[dict]:
         """
@@ -181,7 +221,11 @@ class PRReviewAgent:
 
             general = review_data.get("general_comment")
             if general:
-                self.vcs.post_review_comment(repo_name, pr_number, general)
+                try:
+                    self.vcs.post_review_comment(repo_name, pr_number, general)
+                except Exception as e:
+                    logger.error(f"Failed to post review comment for PR #{pr_number} in {repo_name}: {e}")
+                    raise
 
             inline_comments = review_data.get("inline_comments", [])
             for c in inline_comments:
@@ -198,5 +242,9 @@ class PRReviewAgent:
         except json.JSONDecodeError:
             logger.error(f"Failed to parse LLM JSON output. Raw output: {content}")
             # Fallback: post the raw text as a general comment
-            self.vcs.post_review_comment(repo_name, pr_number, content)
+            try:
+                self.vcs.post_review_comment(repo_name, pr_number, content)
+            except Exception as e:
+                logger.error(f"Failed to post fallback review comment for PR #{pr_number} in {repo_name}: {e}")
+                raise
             return None

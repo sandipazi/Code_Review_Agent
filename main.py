@@ -9,8 +9,10 @@ import asyncio
 import hmac
 import hashlib
 from temporalio.common import WorkflowIDReusePolicy
-from temporalio.client import WorkflowExecutionStatus
+from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
+import concurrent.futures
 from config.settings import settings
 from models.schemas import PullRequestEvent, ChatRequest, ChatResponse, CancelReviewRequest
 from core.adapter_factory import get_vcs_adapter, get_adapters, get_rag_components
@@ -60,11 +62,10 @@ def _review_workflow_id(repo_name: str, pr_number: int) -> str:
     return f"pr-review-{repo_name}-{pr_number}"
 
 async def _start_review_workflow(repo_name: str, pr_number: int, github_token: Optional[str]):
-    try:
-        client = await get_temporal_client()
-    except Exception as e:
-        logger.error(f"Could not reach Temporal server to start review for PR #{pr_number} in {repo_name}: {e}")
-        return
+    """Starts the durable review workflow. Raises on failure (Temporal unreachable,
+    start_workflow error) rather than swallowing — callers need to know the review
+    didn't actually start rather than being told it was "successfully triggered"."""
+    client = await get_temporal_client()
     try:
         await client.start_workflow(
             PRReviewWorkflow.run,
@@ -75,8 +76,6 @@ async def _start_review_workflow(repo_name: str, pr_number: int, github_token: O
         )
     except WorkflowAlreadyStartedError:
         logger.info(f"Review for PR #{pr_number} in {repo_name} is already running.")
-    except Exception as e:
-        logger.error(f"Failed to start review workflow for PR #{pr_number} in {repo_name}: {e}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(chat_request: ChatRequest, request: Request):
@@ -88,6 +87,7 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
     """
     messages = [msg.model_dump() for msg in chat_request.messages]
     github_token = request.headers.get("X-GitHub-Token")
+    loop = asyncio.get_running_loop()
 
     try:
         vcs_adapter, llm_adapter = get_adapters(github_token)
@@ -98,7 +98,21 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
         # Starts a durable Temporal workflow rather than a thread/BackgroundTask — survives
         # process restarts, and multiple reviews triggered in one chat turn run independently
         # instead of queuing behind a shared sequential-await list.
-        asyncio.create_task(_start_review_workflow(repo_name, pr_number, github_token))
+        #
+        # chat_agent.chat(...) below runs on a worker thread (via asyncio.to_thread), so
+        # this callback also runs on that worker thread — asyncio.create_task() would raise
+        # "no running event loop" here. run_coroutine_threadsafe schedules the actual
+        # Temporal gRPC call back onto the main event loop thread where it belongs, while
+        # blocking only this worker thread (not the loop) while waiting for it to start.
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _start_review_workflow(repo_name, pr_number, github_token), loop
+            ).result(timeout=15)
+        except concurrent.futures.TimeoutError:
+            raise RuntimeError(
+                "Timed out starting the review workflow — the Temporal server may be "
+                "unreachable or overloaded."
+            )
 
     try:
         # Build MCPServer and register github tools
@@ -119,7 +133,10 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
             mcp_client=mcp_client,
             rag_retriever=rag_retriever
         )
-        updated_messages = chat_agent.chat(messages)
+        # chat_agent.chat() does blocking sync HTTP calls (LLM + tool calls) — running it
+        # directly on the event loop would freeze the whole app (including /reviews/status
+        # polling) for the duration of every chat turn, sometimes minutes.
+        updated_messages = await asyncio.to_thread(chat_agent.chat, messages)
 
         return JSONResponse({"messages": updated_messages})
     except Exception as e:
@@ -174,20 +191,62 @@ _TEMPORAL_STATUS_MAP = {
     WorkflowExecutionStatus.TERMINATED: "cancelled",
 }
 
+def _unwrap_failure_message(exc: BaseException) -> str:
+    """Walk a Temporal WorkflowFailureError's cause chain (WorkflowFailureError ->
+    ActivityError -> ApplicationError) to the innermost message — this is where an
+    actionable error like the GitHub-permission message set in adapters/vcs/github.py
+    actually lives, rather than a generic "Workflow execution failed"."""
+    current = exc
+    while getattr(current, "cause", None) is not None:
+        current = current.cause
+    return getattr(current, "message", str(current))
+
+
 @app.get("/reviews/status")
 async def review_status(repo_name: str, pr_number: int):
-    """Check the status of a background PR review triggered via /chat's trigger_review tool."""
+    """Check the status of a background PR review triggered via /chat's trigger_review tool.
+
+    Distinguishes three failure modes that all used to collapse into an unhelpful
+    "unknown": the Temporal server being unreachable, a review that was never
+    triggered (or whose trigger failed before the workflow started), and any other
+    error fetching status — vs. a genuinely running/completed/failed review.
+    """
     try:
         client = await get_temporal_client()
-        desc = await client.get_workflow_handle(_review_workflow_id(repo_name, pr_number)).describe()
     except Exception as e:
-        logger.warning(f"Could not fetch review status for PR #{pr_number} in {repo_name}: {e}")
-        return JSONResponse({"status": "unknown"})
+        logger.warning(f"Could not reach Temporal server for PR #{pr_number} in {repo_name}: {e}")
+        return JSONResponse({"status": "unreachable", "error": "Cannot reach the Temporal server — the review backend may be down."})
+
+    handle = client.get_workflow_handle(_review_workflow_id(repo_name, pr_number))
+    try:
+        desc = await handle.describe()
+    except RPCError as e:
+        if e.status == RPCStatusCode.NOT_FOUND:
+            return JSONResponse({
+                "status": "not_found",
+                "error": "No review found for this PR — it may never have been triggered, or the trigger failed before the workflow started.",
+            })
+        logger.warning(f"Error fetching review status for PR #{pr_number} in {repo_name}: {e}")
+        return JSONResponse({"status": "error", "error": str(e)})
+    except Exception as e:
+        logger.warning(f"Error fetching review status for PR #{pr_number} in {repo_name}: {e}")
+        return JSONResponse({"status": "error", "error": str(e)})
 
     status = _TEMPORAL_STATUS_MAP.get(desc.status, "unknown")
+    error_message = None
+    if status == "failed":
+        try:
+            await handle.result()
+        except WorkflowFailureError as wfe:
+            error_message = _unwrap_failure_message(wfe)
+        except Exception as e:
+            error_message = str(e)
+        else:
+            error_message = str(desc.status)
+
     return JSONResponse({
         "status": status,
-        "error": str(desc.status) if status == "failed" else None,
+        "error": error_message,
         "started_at": desc.start_time.isoformat() if desc.start_time else None,
         "finished_at": desc.close_time.isoformat() if desc.close_time else None,
     })

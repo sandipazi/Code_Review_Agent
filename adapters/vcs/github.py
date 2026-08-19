@@ -1,9 +1,29 @@
 import httpx
 from typing import List, Dict, Any
-from .base import BaseVCSAdapter
+from .base import BaseVCSAdapter, VCSPermissionError
 import logging
 
 logger = logging.getLogger(__name__)
+
+_PERMISSION_ERROR_HINT = (
+    "GitHub rejected posting a comment to {repo}#{pr} ({status}). The provided token "
+    "likely lacks the required scope — for classic PATs it needs the `repo` scope; for "
+    "fine-grained PATs it needs 'Pull requests: write' and 'Issues: write' on this "
+    "repository. Update the token and re-trigger the review."
+)
+
+
+def _raise_for_status_with_permission_check(response: httpx.Response, repo_name: str, pr_number: int) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            raise VCSPermissionError(
+                _PERMISSION_ERROR_HINT.format(repo=repo_name, pr=pr_number, status=e.response.status_code),
+                status_code=e.response.status_code,
+                detail=e.response.text,
+            ) from e
+        raise
 
 class GitHubAdapter(BaseVCSAdapter):
     def __init__(self, token: str):
@@ -57,7 +77,7 @@ class GitHubAdapter(BaseVCSAdapter):
             f"/repos/{repo_name}/issues/{pr_number}/comments",
             json={"body": comment}
         )
-        response.raise_for_status()
+        _raise_for_status_with_permission_check(response, repo_name, pr_number)
         logger.info(f"Posted review comment to PR #{pr_number}")
 
     def post_inline_comment(self, repo_name: str, pr_number: int, commit_id: str, path: str, line: int, comment: str) -> None:
@@ -70,7 +90,7 @@ class GitHubAdapter(BaseVCSAdapter):
                 "line": line
             }
         )
-        response.raise_for_status()
+        _raise_for_status_with_permission_check(response, repo_name, pr_number)
         logger.info(f"Posted inline comment to {path}:{line} on PR #{pr_number}")
 
     def close(self):
