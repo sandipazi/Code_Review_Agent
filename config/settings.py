@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     MAX_DIFF_CHARS: int = 24000
     MAX_RAG_CONTEXT_CHARS: int = 4000
 
+    # Temporal (durable execution for PR review jobs)
+    TEMPORAL_ADDRESS: str = "localhost:7233"
+    TEMPORAL_NAMESPACE: str = "default"
+    TEMPORAL_TASK_QUEUE: str = "pr-review-task-queue"
+
     # RAG Configuration
     RAG_ENABLED: bool = True
     RAG_DB_PATH: str = "./.rag_db"

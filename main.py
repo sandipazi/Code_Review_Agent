@@ -5,27 +5,23 @@ from fastapi.responses import JSONResponse
 # pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+import asyncio
 import hmac
 import hashlib
-import threading
+from temporalio.common import WorkflowIDReusePolicy
+from temporalio.client import WorkflowExecutionStatus
+from temporalio.exceptions import WorkflowAlreadyStartedError
 from config.settings import settings
 from models.schemas import PullRequestEvent, ChatRequest, ChatResponse, CancelReviewRequest
-from adapters.vcs.github import GitHubAdapter
-from adapters.llm.openai import OpenAIAdapter
-from core.agent import PRReviewAgent
+from core.adapter_factory import get_vcs_adapter, get_adapters, get_rag_components
+from core.temporal_client import get_temporal_client
+from core.temporal_workflows import PRReviewWorkflow
 from core.chat_agent import ChatAgent
 from core.mcp_client import InternalMCPClient
-from core.review_jobs import review_job_store
 from mcp_server.server import MCPServer
 from mcp_server.http_transport import router as mcp_router
 from mcp_server.tools.github_tools import GitHubTools
 from mcp_server.tools.rag_tools import RAGTools
-from rag.embedder.local_embedder import LocalEmbedder
-from rag.embedder.openai_embedder import OpenAIEmbedder
-from rag.vector_store.chroma_store import ChromaVectorStore
-from rag.vector_store.qdrant_store import QdrantVectorStore
-from rag.retriever import RAGRetriever
-from rag.ingestion.github_ingester import GitHubIngester
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -60,151 +56,27 @@ def verify_signature(payload: bytes, signature_header: str) -> bool:
     ).hexdigest()
     return hmac.compare_digest(expected_mac, parts[1])
 
-def get_vcs_adapter(github_token: Optional[str] = None) -> GitHubAdapter:
-    """Helper to instantiate the VCS adapter alone (no LLM key required)."""
-    token = github_token or settings.GITHUB_TOKEN
-    if not token:
-        raise Exception("GitHub token not configured.")
-    return GitHubAdapter(token=token)
+def _review_workflow_id(repo_name: str, pr_number: int) -> str:
+    return f"pr-review-{repo_name}-{pr_number}"
 
-def _build_llm_adapter(provider_name: str, github_token: str):
-    """Build a single LLM adapter for the named provider, or None if it's
-    unconfigured/unsupported (callers decide whether that's fatal)."""
-    provider = provider_name.lower()
-    if provider == "openai":
-        if not settings.OPENAI_API_KEY:
-            return None
-        return OpenAIAdapter(api_key=settings.OPENAI_API_KEY)
-    elif provider == "github_models":
-        from adapters.llm.github_models import GitHubModelsAdapter
-        return GitHubModelsAdapter(token=github_token, model=settings.GITHUB_MODEL_NAME)
-    elif provider == "groq":
-        if not settings.GROQ_API_KEY:
-            return None
-        from adapters.llm.groq import GroqAdapter
-        return GroqAdapter(api_key=settings.GROQ_API_KEY, model=settings.GROQ_MODEL_NAME)
-    elif provider == "openrouter":
-        if not settings.OPENROUTER_API_KEY:
-            return None
-        from adapters.llm.openrouter import OpenRouterAdapter
-        return OpenRouterAdapter(
-            api_key=settings.OPENROUTER_API_KEY,
-            model=settings.OPENROUTER_MODEL_NAME,
-            site_url=settings.OPENROUTER_SITE_URL,
-            app_name=settings.OPENROUTER_APP_NAME,
-        )
-    return None
-
-def get_adapters(github_token: Optional[str] = None):
-    """Helper to instantiate VCS and LLM adapters."""
-    vcs_adapter = get_vcs_adapter(github_token)
-    token = github_token or settings.GITHUB_TOKEN
-
-    primary = _build_llm_adapter(settings.LLM_PROVIDER, token)
-    if primary is None:
-        raise Exception(f"Unsupported or unconfigured LLM provider: {settings.LLM_PROVIDER}")
-
-    fallback_names = [p.strip() for p in settings.LLM_FALLBACK_PROVIDERS.split(",") if p.strip()]
-    fallback_adapters = []
-    for name in fallback_names:
-        adapter = _build_llm_adapter(name, token)
-        if adapter is None:
-            logger.warning(f"Skipping fallback LLM provider '{name}': not configured or unsupported.")
-            continue
-        fallback_adapters.append(adapter)
-
-    if fallback_adapters:
-        from adapters.llm.fallback import FallbackLLMAdapter
-        llm_adapter = FallbackLLMAdapter([primary] + fallback_adapters)
-    else:
-        llm_adapter = primary
-
-    return vcs_adapter, llm_adapter
-
-def get_rag_components(vcs_adapter=None):
-    """Helper to instantiate RAG components based on settings."""
-    if not settings.RAG_ENABLED:
-        return None, None
-
-    # Embedder
-    if settings.RAG_EMBEDDER.lower() == "openai":
-        if not settings.OPENAI_API_KEY:
-            logger.warning("OpenAI API key missing, falling back to local embedder.")
-            embedder = LocalEmbedder()
-        else:
-            embedder = OpenAIEmbedder(api_key=settings.OPENAI_API_KEY)
-    else:
-        embedder = LocalEmbedder()
-
-    # Vector Store
-    if settings.RAG_VECTOR_STORE.lower() == "qdrant":
-        vector_store = QdrantVectorStore(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY, vector_size=embedder.vector_size)
-    else:
-        vector_store = ChromaVectorStore(persist_directory=settings.RAG_DB_PATH)
-
-    # Retriever
-    retriever = RAGRetriever(
-        embedder=embedder, 
-        vector_store=vector_store, 
-        top_k=settings.RAG_TOP_K
-    )
-
-    # Ingester (optional, needs VCS adapter)
-    ingester = None
-    if vcs_adapter:
-        ingester = GitHubIngester(
-            vcs_adapter=vcs_adapter,
-            embedder=embedder,
-            vector_store=vector_store
-        )
-
-    return retriever, ingester
-
-def run_deep_review(
-    repo_name: str,
-    pr_number: int,
-    github_token: Optional[str] = None,
-    cancel_event: Optional[threading.Event] = None,
-):
-    """Runs the deep PR review. Invoked in its own daemon thread (see trigger_review_callback)
-    so multiple triggered reviews run truly in parallel rather than queuing."""
-    logger.info(f"Starting background review for PR #{pr_number} in {repo_name}")
+async def _start_review_workflow(repo_name: str, pr_number: int, github_token: Optional[str]):
     try:
-        vcs_adapter, llm_adapter = get_adapters(github_token)
-
-        # We need an MCP Client for the deep review as well
-        mcp_server = MCPServer()
-
-        # Setup RAG
-        rag_retriever, github_ingester = get_rag_components(vcs_adapter)
-        if rag_retriever:
-            rag_tools = RAGTools(retriever=rag_retriever, default_repo=repo_name)
-            mcp_server.register_rag_tools(rag_tools)
-
-        mcp_client = InternalMCPClient(mcp_server)
-
-        agent = PRReviewAgent(
-            vcs_adapter=vcs_adapter,
-            llm_adapter=llm_adapter,
-            mcp_client=mcp_client,
-            rag_retriever=rag_retriever,
-            github_ingester=github_ingester,
-            cancel_event=cancel_event,
-        )
-        agent.review_pr(repo_name, pr_number)
-        if cancel_event is not None and cancel_event.is_set():
-            review_job_store.mark_cancelled(repo_name, pr_number)
-        else:
-            review_job_store.mark_completed(repo_name, pr_number)
+        client = await get_temporal_client()
     except Exception as e:
-        logger.error(f"Review failed: {e}")
-        review_job_store.mark_failed(repo_name, pr_number, str(e))
-    finally:
-        try:
-            vcs_adapter.close()
-            llm_adapter.close()
-        except Exception:
-            pass
+        logger.error(f"Could not reach Temporal server to start review for PR #{pr_number} in {repo_name}: {e}")
+        return
+    try:
+        await client.start_workflow(
+            PRReviewWorkflow.run,
+            args=[repo_name, pr_number, github_token],
+            id=_review_workflow_id(repo_name, pr_number),
+            task_queue=settings.TEMPORAL_TASK_QUEUE,
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+        )
+    except WorkflowAlreadyStartedError:
+        logger.info(f"Review for PR #{pr_number} in {repo_name} is already running.")
+    except Exception as e:
+        logger.error(f"Failed to start review workflow for PR #{pr_number} in {repo_name}: {e}")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(chat_request: ChatRequest, request: Request):
@@ -223,23 +95,17 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
     def trigger_review_callback(repo_name: str, pr_number: int):
-        # Each review runs in its own daemon thread rather than FastAPI's BackgroundTasks —
-        # BackgroundTasks awaits every task registered on one request sequentially, which would
-        # serialize multiple reviews triggered in the same chat turn instead of running them
-        # in parallel.
-        cancel_event = review_job_store.mark_pending(repo_name, pr_number)
-        threading.Thread(
-            target=run_deep_review,
-            args=(repo_name, pr_number, github_token, cancel_event),
-            daemon=True,
-        ).start()
+        # Starts a durable Temporal workflow rather than a thread/BackgroundTask — survives
+        # process restarts, and multiple reviews triggered in one chat turn run independently
+        # instead of queuing behind a shared sequential-await list.
+        asyncio.create_task(_start_review_workflow(repo_name, pr_number, github_token))
 
     try:
         # Build MCPServer and register github tools
         mcp_server = MCPServer()
         github_tools = GitHubTools(vcs_adapter=vcs_adapter, review_callback=trigger_review_callback)
         mcp_server.register_github_tools(github_tools)
-        
+
         # Setup RAG
         rag_retriever, _ = get_rag_components()
         if rag_retriever:
@@ -247,14 +113,14 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
             mcp_server.register_rag_tools(rag_tools)
 
         mcp_client = InternalMCPClient(mcp_server)
-        
+
         chat_agent = ChatAgent(
-            llm_adapter=llm_adapter, 
+            llm_adapter=llm_adapter,
             mcp_client=mcp_client,
             rag_retriever=rag_retriever
         )
         updated_messages = chat_agent.chat(messages)
-        
+
         return JSONResponse({"messages": updated_messages})
     except Exception as e:
         logger.error(f"Chat error: {e}")
@@ -299,18 +165,45 @@ async def list_repo_pulls(repo_name: str, request: Request, state: str = "open")
     finally:
         vcs_adapter.close()
 
+_TEMPORAL_STATUS_MAP = {
+    WorkflowExecutionStatus.RUNNING: "pending",
+    WorkflowExecutionStatus.COMPLETED: "completed",
+    WorkflowExecutionStatus.FAILED: "failed",
+    WorkflowExecutionStatus.TIMED_OUT: "failed",
+    WorkflowExecutionStatus.CANCELED: "cancelled",
+    WorkflowExecutionStatus.TERMINATED: "cancelled",
+}
+
 @app.get("/reviews/status")
 async def review_status(repo_name: str, pr_number: int):
     """Check the status of a background PR review triggered via /chat's trigger_review tool."""
-    job = review_job_store.get(repo_name, pr_number)
-    return JSONResponse(job or {"status": "unknown"})
+    try:
+        client = await get_temporal_client()
+        desc = await client.get_workflow_handle(_review_workflow_id(repo_name, pr_number)).describe()
+    except Exception as e:
+        logger.warning(f"Could not fetch review status for PR #{pr_number} in {repo_name}: {e}")
+        return JSONResponse({"status": "unknown"})
+
+    status = _TEMPORAL_STATUS_MAP.get(desc.status, "unknown")
+    return JSONResponse({
+        "status": status,
+        "error": str(desc.status) if status == "failed" else None,
+        "started_at": desc.start_time.isoformat() if desc.start_time else None,
+        "finished_at": desc.close_time.isoformat() if desc.close_time else None,
+    })
 
 @app.post("/reviews/cancel")
 async def cancel_review(payload: CancelReviewRequest):
     """Cooperatively cancel a running PR review. Takes effect at the next ReAct-loop
     checkpoint, not instantly — the job may still finish if it was already about to."""
-    found = review_job_store.request_cancel(payload.repo_name, payload.pr_number)
-    if not found:
+    try:
+        client = await get_temporal_client()
+    except Exception as e:
+        logger.error(f"Could not reach Temporal server: {e}")
+        raise HTTPException(status_code=503, detail="Temporal server unreachable.")
+    try:
+        await client.get_workflow_handle(_review_workflow_id(payload.repo_name, payload.pr_number)).cancel()
+    except Exception:
         raise HTTPException(status_code=404, detail="No review job found for that repo/PR.")
     return JSONResponse({"status": "cancelling"})
 
@@ -321,7 +214,7 @@ async def github_webhook(request: Request):
     """
     signature_header = request.headers.get("x-hub-signature-256")
     body = await request.body()
-    
+
     if not verify_signature(body, signature_header):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
@@ -340,7 +233,7 @@ async def github_webhook(request: Request):
         except Exception as e:
             logger.error(f"Failed to parse event: {e}")
             raise HTTPException(status_code=422, detail="Invalid event schema")
-    
+
     return JSONResponse({"status": "ignored", "message": f"Event {event_type} ignored"})
 
 if __name__ == "__main__":

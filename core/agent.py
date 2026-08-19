@@ -1,11 +1,10 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Callable, List, Optional
 from adapters.vcs.base import BaseVCSAdapter
 from adapters.llm.base import BaseLLMAdapter, LLMMessage
 from core.mcp_client import InternalMCPClient
 from config.settings import settings
 import json
 import logging
-import threading
 
 logger = logging.getLogger(__name__)
 
@@ -18,14 +17,14 @@ class PRReviewAgent:
         mcp_client: InternalMCPClient,
         rag_retriever=None,       # Optional[RAGRetriever] — avoids circular import
         github_ingester=None,     # Optional[GitHubIngester] — for auto-ingest post-review
-        cancel_event: Optional[threading.Event] = None,  # cooperative stop signal
+        heartbeat: Optional[Callable[[], None]] = None,  # called each loop iteration; may raise to abort
     ):
         self.vcs = vcs_adapter
         self.llm = llm_adapter
         self.mcp = mcp_client
         self.rag = rag_retriever        # None → RAG disabled, fully backward-compatible
         self.ingester = github_ingester # None → auto-ingest disabled
-        self.cancel_event = cancel_event
+        self.heartbeat = heartbeat
         self.max_loops = 5
 
     def review_pr(self, repo_name: str, pr_number: int):
@@ -114,9 +113,8 @@ class PRReviewAgent:
         # 5. Agent ReAct Loop
         final_review_data: Optional[dict] = None
         for i in range(self.max_loops):
-            if self.cancel_event is not None and self.cancel_event.is_set():
-                logger.info(f"Review of PR #{pr_number} in {repo_name} was cancelled")
-                return
+            if self.heartbeat is not None:
+                self.heartbeat()  # e.g. Temporal's activity.heartbeat — raises if cancelled
 
             logger.info(f"Agent loop iteration {i+1}/{self.max_loops}")
             response = self.llm.generate(messages, tools=tools)
